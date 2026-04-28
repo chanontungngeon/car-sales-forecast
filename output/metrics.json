@@ -1,0 +1,20 @@
+[
+  {
+    "model": "ARIMA",
+    "MAE": 195.4,
+    "RMSE": 246.4,
+    "MAPE": 2.16
+  },
+  {
+    "model": "XGBoost",
+    "MAE": 27.9,
+    "RMSE": 38.5,
+    "MAPE": 7.16
+  },
+  {
+    "model": "LightGBM",
+    "MAE": 28.0,
+    "RMSE": 39.1,
+    "MAPE": 7.18
+  }
+]
