@@ -1,8 +1,9 @@
 """
 streamlit_app.py — Interactive Car Sales Forecasting Dashboard
 ===============================================================
-A three-tab Streamlit app that lets business users explore the data,
-run forecasts, and compare model performance — all without touching code.
+A four-tab Streamlit app that lets business users explore the data,
+run forecasts, compare model performance, and understand how to keep
+the model healthy in production.
 
 Streamlit execution model:
     Streamlit re-executes the ENTIRE script from top to bottom every time
@@ -12,12 +13,14 @@ Streamlit execution model:
     @st.cache_resource are critical for performance (they prevent
     expensive operations from rerunning on every click).
 
-Three tabs:
+Four tabs:
     Tab 1 — Overview & EDA    : KPI cards, trend, seasonality, region, promo
     Tab 2 — Forecast          : ARIMA with confidence intervals, or tree model
                                 actual vs predicted, with brand-level drill-down
     Tab 3 — Model Comparison  : MAPE / MAE / RMSE table, feature importance,
                                 actual vs predicted scatter, residuals
+    Tab 4 — Model Maintenance : health KPIs, quarterly MAPE trend, data drift
+                                detection, retraining policy, MLOps workflow
 
 Run:  streamlit run app/streamlit_app.py
 """
@@ -234,7 +237,9 @@ mask = (
 filtered = df[mask].copy()
 
 # ── Tab layout ────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["📈 Overview & EDA", "🔮 Forecast", "📊 Model Comparison"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📈 Overview & EDA", "🔮 Forecast", "📊 Model Comparison", "🔧 Model Maintenance"
+])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -610,3 +615,324 @@ with tab3:
         if rs_path.exists():
             st.markdown("### Residual Distribution")
             st.image(str(rs_path), use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — Model Maintenance
+# ══════════════════════════════════════════════════════════════════════════════
+# This tab answers the question every ML deployment eventually faces:
+# "How do I know when my model has stopped working, and what do I do then?"
+#
+# Two root causes of model degradation:
+#   Data drift (covariate shift) — the INPUT distribution changes.
+#       Example: average car prices rise 20% due to supply-chain costs.
+#       The model was calibrated on lower prices and under-predicts.
+#   Concept drift (relationship shift) — the TARGET relationship changes.
+#       Example: a recession makes promotions less effective (15% → 5% uplift).
+#       Even if feature distributions look the same, the model's learned
+#       coefficients are now stale.
+#
+# We detect both indirectly:
+#   • Rising MAPE over time → concept drift or compound data drift
+#   • Distribution shift in features → data drift
+#
+# Retraining policy encoded here:
+#   MAPE < 10%  → KEEP    (model is healthy)
+#   10–15%      → WATCH   (investigate, prepare new data)
+#   > 15%       → RETRAIN (trigger pipeline immediately)
+
+with tab4:
+    st.markdown("## Model Health & Maintenance")
+    st.markdown(
+        "Monitor whether the deployed XGBoost model is still performing well, "
+        "detect when the input data has drifted from the training distribution, "
+        "and understand when to trigger a retraining run."
+    )
+
+    # ── Helper: symmetric KL divergence (inlined from monitor.py) ─────────────
+    # We re-implement here rather than importing from monitoring/ to avoid
+    # path-resolution issues when the app is hosted on Streamlit Cloud.
+    def _kl_sym(p: np.ndarray, q: np.ndarray, bins: int = 25) -> float:
+        """
+        Symmetric KL divergence between two empirical distributions.
+
+        Uses the same bin edges for both histograms so the comparison is
+        over identical intervals.  Adding 1e-8 prevents log(0) when a bin
+        is empty in one distribution but not the other.
+
+        Score guide:  ~0 = nearly identical  |  0.1+ = noticeable  |  1+ = large shift
+        """
+        p_hist, edges = np.histogram(p, bins=bins, density=True)
+        q_hist, _     = np.histogram(q, bins=edges, density=True)
+        p_hist += 1e-8
+        q_hist += 1e-8
+        return float(
+            0.5 * np.sum(p_hist * np.log(p_hist / q_hist) + q_hist * np.log(q_hist / p_hist))
+        )
+
+    # ── Section 1: Current model health KPIs ──────────────────────────────────
+    xgb_mape = next((m["MAPE"] for m in metrics if m["model"] == "XGBoost"), None)
+
+    if xgb_mape is None:
+        st.warning("No metrics found. Run `python main.py` to train models first.")
+    else:
+        # Map MAPE to a traffic-light status and colour.
+        if xgb_mape < 10:
+            status, status_color = "KEEP", "#2ebd7a"
+        elif xgb_mape < 15:
+            status, status_color = "WATCH", "#e8952a"
+        else:
+            status, status_color = "RETRAIN", "#c81934"
+
+        k1, k2, k3, k4 = st.columns(4)
+        kpi_card(k1, "Current MAPE (XGBoost)", f"{xgb_mape:.1f}%",  "on 2024 held-out test set", "#3a68a8")
+        kpi_card(k2, "Model Decision",          status,               "KEEP < 10% | WATCH < 15%",   status_color)
+        kpi_card(k3, "Training Window",          "2018 – 2023",        "72 months of history",        "#1b2a4a")
+        kpi_card(k4, "Retrain Trigger",          "> 15% MAPE",         "triggers pipeline run",       "#e8952a")
+
+    st.markdown("---")
+
+    # ── Section 2: Quarterly MAPE trend ───────────────────────────────────────
+    # We compute the ACTUAL per-quarter MAPE from the XGBoost model on 2024
+    # data, then append a SIMULATED degradation curve for 2025–2026 to
+    # illustrate what would happen if the model were never retrained.
+    # This makes the retraining thresholds tangible for a business audience.
+    st.markdown("### MAPE Over Time — Performance Monitoring")
+    st.caption(
+        "Solid line = actual model performance on 2024 test data (real).  "
+        "Dashed line = simulated drift if the model is never retrained (illustrative)."
+    )
+
+    xgb_model = load_model("xgboost")
+    if xgb_model is not None:
+        from data_prep import make_tree_features, FEATURE_COLS
+
+        # Re-engineer features on the full dataset so lag_12 for Jan 2024
+        # correctly looks back to Jan 2023 (not clipped by a filter).
+        df_feat    = make_tree_features(df)
+        test_2024  = df_feat[df_feat["year"] == 2024].copy()
+        test_2024["predicted"] = np.clip(
+            xgb_model.predict(test_2024[FEATURE_COLS]), 0, None
+        )
+
+        # Map each row to its calendar quarter ("2024Q1", "2024Q2", …).
+        test_2024["quarter"] = test_2024["date"].dt.to_period("Q").astype(str)
+
+        # Per-quarter MAPE: exclude rows where actual = 0 to avoid div-by-zero.
+        qmape_rows = []
+        for q_label, grp in test_2024.groupby("quarter"):
+            actual = grp["sales"].values
+            pred   = grp["predicted"].values
+            mask   = actual != 0
+            q_mape = float(np.mean(np.abs((actual[mask] - pred[mask]) / actual[mask])) * 100)
+            qmape_rows.append({"Quarter": q_label, "MAPE": round(q_mape, 2), "Series": "Actual (2024)"})
+
+        # Simulate future degradation starting from the last real MAPE.
+        # Each simulated quarter applies a compounding drift factor (8–12% per quarter)
+        # to represent concept drift as market conditions evolve post-2024.
+        last_real = qmape_rows[-1]["MAPE"]
+        sim_quarters = ["2025Q1", "2025Q2", "2025Q3", "2025Q4", "2026Q1"]
+        drift_factors = [1.08, 1.20, 1.36, 1.55, 1.78]
+        for sq, df_factor in zip(sim_quarters, drift_factors):
+            qmape_rows.append({
+                "Quarter": sq,
+                "MAPE":    round(last_real * df_factor, 2),
+                "Series":  "Simulated drift (no retrain)",
+            })
+
+        qmape_df = pd.DataFrame(qmape_rows)
+
+        fig_trend = go.Figure()
+
+        # Actual 2024 trace
+        actual_df = qmape_df[qmape_df["Series"] == "Actual (2024)"]
+        fig_trend.add_trace(go.Scatter(
+            x=actual_df["Quarter"], y=actual_df["MAPE"],
+            name="Actual 2024",
+            mode="lines+markers",
+            line=dict(color="#3a68a8", width=3),
+            marker=dict(size=8),
+        ))
+
+        # Simulated degradation trace
+        sim_df = qmape_df[qmape_df["Series"] == "Simulated drift (no retrain)"]
+        fig_trend.add_trace(go.Scatter(
+            x=sim_df["Quarter"], y=sim_df["MAPE"],
+            name="Simulated drift (no retrain)",
+            mode="lines+markers",
+            line=dict(color="#e8952a", width=2, dash="dash"),
+            marker=dict(size=7, symbol="diamond"),
+        ))
+
+        # Threshold reference lines — drawn as horizontal lines spanning the chart.
+        # These are the actionable decision boundaries from monitor.py THRESHOLDS.
+        fig_trend.add_hline(
+            y=10, line_dash="dot", line_color="#e8952a", line_width=1.5,
+            annotation_text="WATCH threshold (10%)",
+            annotation_position="top right",
+            annotation_font_color="#e8952a",
+        )
+        fig_trend.add_hline(
+            y=15, line_dash="dot", line_color="#c81934", line_width=1.5,
+            annotation_text="RETRAIN threshold (15%)",
+            annotation_position="top right",
+            annotation_font_color="#c81934",
+        )
+
+        # Shade the WATCH zone (10–15%) to make the risk band visually obvious.
+        fig_trend.add_hrect(
+            y0=10, y1=15,
+            fillcolor="rgba(232,149,42,0.08)",
+            layer="below", line_width=0,
+        )
+        # Shade the RETRAIN zone (15+)
+        fig_trend.add_hrect(
+            y0=15, y1=30,
+            fillcolor="rgba(200,25,52,0.07)",
+            layer="below", line_width=0,
+        )
+
+        fig_trend.update_layout(
+            title="XGBoost MAPE by Quarter",
+            xaxis_title="Quarter",
+            yaxis_title="MAPE (%)",
+            yaxis=dict(range=[0, max(qmape_df["MAPE"].max() * 1.15, 20)]),
+            hovermode="x unified",
+            legend=dict(orientation="h", y=-0.18),
+        )
+        st.plotly_chart(fig_trend, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── Section 3: Data drift detection ───────────────────────────────────────
+    # Compare the distribution of key features between the training window
+    # (2018–2022) and the most recent full year (2024).
+    # A significant shift means the model is scoring on data it never "saw"
+    # during training, which is a leading indicator of rising MAPE.
+    st.markdown("### Data Drift Detection")
+    st.caption(
+        "Reference = training data (2018–2022).  "
+        "Current = most recent data (2024).  "
+        "Alert threshold: mean shift > 2 standard deviations."
+    )
+
+    ref_data = df[df["year"] <= 2022]
+    cur_data = df[df["year"] == 2024]
+
+    drift_col_left, drift_col_right = st.columns(2)
+
+    for i, (feat, label) in enumerate([
+        ("sales",     "Sales Volume (units/month)"),
+        ("price_avg", "Average Vehicle Price (THB)"),
+    ]):
+        col = drift_col_left if i == 0 else drift_col_right
+        with col:
+            ref_vals = ref_data[feat].dropna().values
+            cur_vals = cur_data[feat].dropna().values
+
+            # Mean shift normalised by training std dev — scale-independent.
+            mean_shift = abs(cur_vals.mean() - ref_vals.mean()) / (ref_vals.std() + 1e-8)
+            kl         = _kl_sym(ref_vals, cur_vals)
+            drifted    = mean_shift > 2.0
+
+            # Overlapping histograms: the visual overlap shows how similar the
+            # distributions are.  Large separation = strong drift.
+            fig_hist = go.Figure()
+            fig_hist.add_trace(go.Histogram(
+                x=ref_vals, name="Training (2018–22)",
+                opacity=0.65, marker_color="#3a68a8", nbinsx=30,
+            ))
+            fig_hist.add_trace(go.Histogram(
+                x=cur_vals, name="Current (2024)",
+                opacity=0.65, marker_color="#c81934", nbinsx=30,
+            ))
+            fig_hist.update_layout(
+                barmode="overlay",
+                title=label,
+                xaxis_title=feat,
+                yaxis_title="Count",
+                legend=dict(orientation="h", y=-0.22),
+                margin=dict(b=60),
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+            # Drift verdict badge: colour-coded so it reads at a glance.
+            badge_color = "#c81934" if drifted else "#2ebd7a"
+            badge_text  = "DRIFT DETECTED" if drifted else "OK — No Drift"
+            st.markdown(
+                f"""
+                <div style="background:#f8f9fc;border-radius:8px;padding:12px 16px;
+                            border-left:4px solid {badge_color};margin-bottom:8px;">
+                  <strong style="color:{badge_color};">{badge_text}</strong><br>
+                  <span style="font-size:13px;color:#6b7a95;">
+                    Mean shift: <strong>{mean_shift:.2f}</strong> std devs &nbsp;|&nbsp;
+                    KL divergence: <strong>{kl:.4f}</strong><br>
+                    Ref mean: {ref_vals.mean():,.0f} &nbsp;→&nbsp; Cur mean: {cur_vals.mean():,.0f}
+                  </span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("---")
+
+    # ── Section 4: Retraining decision matrix ─────────────────────────────────
+    # A plain lookup table mapping MAPE ranges to business actions.
+    # In a production MLOps system, the "RETRAIN" row would trigger a
+    # SageMaker Training Job or an Airflow DAG automatically.
+    st.markdown("### Retraining Decision Matrix")
+
+    policy_df = pd.DataFrame([
+        {
+            "MAPE Range":       "< 10%",
+            "Status":           "KEEP",
+            "Action":           "No action — model is healthy",
+            "Review Frequency": "Monthly",
+        },
+        {
+            "MAPE Range":       "10% – 15%",
+            "Status":           "WATCH",
+            "Action":           "Investigate root cause; collect more recent data",
+            "Review Frequency": "Weekly",
+        },
+        {
+            "MAPE Range":       "> 15%",
+            "Status":           "RETRAIN",
+            "Action":           "Trigger retraining pipeline; promote new model after validation",
+            "Review Frequency": "Daily",
+        },
+    ])
+    st.dataframe(policy_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ── Section 5: MLOps retraining workflow ──────────────────────────────────
+    # Explains the end-to-end loop: detect → collect → retrain → validate → deploy.
+    # This section is intentionally narrative — the goal is to give a non-technical
+    # stakeholder a mental model of what "retraining" actually involves.
+    st.markdown("### Retraining Workflow (6-Step MLOps Loop)")
+
+    steps = [
+        ("1 — Detect",    "#3a68a8", "MAPE rises above 15% on the weekly monitoring run, OR data drift is flagged on a key feature (mean shift > 2 std devs)."),
+        ("2 — Collect",   "#3a68a8", "Append the latest sales records (new months) to `data/car_sales.csv`.  The more recent data, the better the model captures current market conditions."),
+        ("3 — Retrain",   "#e8952a", "Run `python main.py --skip-data` to re-engineer features and retrain XGBoost and LightGBM on the expanded dataset (now including the new months)."),
+        ("4 — Validate",  "#e8952a", "Evaluate the new model on a recent held-out window (last 3 months).  Only promote if MAPE improves vs the current production model."),
+        ("5 — Deploy",    "#2ebd7a", "Upload the new `model_xgboost.pkl` to S3 and update the SageMaker endpoint: `sm_model.deploy(...)`.  Zero-downtime because SageMaker spins up the new container before decommissioning the old one."),
+        ("6 — Reset",     "#2ebd7a", "Set the new model as the baseline in the monitoring system.  The MAPE clock restarts from the new model's performance level."),
+    ]
+
+    for title, color, desc in steps:
+        st.markdown(
+            f"""
+            <div style="display:flex;align-items:flex-start;gap:14px;
+                        margin-bottom:10px;padding:14px 18px;
+                        background:#fff;border-radius:8px;
+                        border:1px solid #dde1e9;border-left:4px solid {color};">
+              <div style="min-width:110px;font-weight:700;color:{color};font-size:13px;">
+                {title}
+              </div>
+              <div style="font-size:13px;color:#3a4560;line-height:1.6;">{desc}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
